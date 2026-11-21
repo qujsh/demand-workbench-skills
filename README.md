@@ -38,7 +38,7 @@ npx skills add qujsh/demand-workbench-skills --skill demand-workbench-archive -a
 
 只提交当前轮问答及明确图片，不采集历史会话、工具日志、隐藏推理或仓库文件。图片先直传存储，再通过 MCP 图片编号关联笔记。默认空标题、私密笔记、Markdown 原文、三级标签。密钥不随 Skill 分发。
 
-每轮先做最多2秒的无正文门禁；失败按地址缓存60秒，期间跳过上传。后台上传失败不补传；queued只表示入队。依赖助手执行，遇到中断可能漏记，仍有传递正文的 token 开销，并非常驻后台同步器。
+每轮先做最多2秒的无正文门禁；失败按地址缓存60秒，期间跳过上传。图片核验临时故障当轮最多尝试3次，每次最多3秒；仍失败保存正文及已核验图片，标记部分成功。其他上传步骤失败不补传；queued只表示入队。依赖助手执行，遇到中断可能漏记，仍有传递正文的 token 开销，并非常驻后台同步器。
 
 详细配置与限制见 [setup.md](skills/demand-workbench-archive/references/setup.md)。
 
@@ -50,3 +50,5 @@ python3 tools/package_skill.py
 ```
 
 推送 `v*` 标签后，GitHub Actions 验证脚本并创建含ZIP和SHA256SUMS的 Release。安装包只包含公开Skill源文件；不包含任何用户配置、密钥、聊天记录或图片。
+
+核验策略和安全错误诊断从v0.1.1提供；搭配新版后端可返回准确存储错误码，并将服务端核验总预算限制为2秒。后端尚未升级时仍可保存正文，但不能准确分类旧版Internal error。

@@ -320,6 +320,26 @@ def credential():
     return result.stdout.strip()
 
 
+class ImageConfirmationFailed(Exception):
+    """仅图片确认可降级，原始异常及供应商响应不写入日志。"""
+    def __init__(self, detail):
+        self.detail = detail
+        super().__init__('图片未确认')
+
+
+def safe_error(error, stage, tool='', elapsed_ms=0):
+    detail = error.detail() if callable(getattr(error, 'detail', None)) else {}
+    code = detail.get('code', type(error).__name__)
+    if not (re.fullmatch(r'(?:S[0-9]{9}|-[0-9]{5}|HTTP_[1-5][0-9]{2})', str(code)) or code in {'NETWORK_TIMEOUT', 'NETWORK_ERROR', 'CONFIRM_WORKER_FAILED', 'INVALID_RESPONSE', 'REMOTE_ERROR', 'OSError', 'TimeoutError', 'ValueError', 'FileNotFoundError', 'KeyError', 'JSONDecodeError'}):
+        code = 'UNKNOWN_ERROR'
+    request_no = detail.get('requestNo', '')
+    return {'stage': stage, 'tool': tool, 'code': code,
+            'message': {'S048105012': '图片存储核验超时', 'S048105013': '图片存储核验暂不可用',
+                        'NETWORK_TIMEOUT': '请求超时', 'NETWORK_ERROR': '网络请求失败'}.get(code, '操作失败'),
+            'requestNo': request_no if isinstance(request_no, str) and re.fullmatch(r'CALL-[A-Za-z0-9-]{1,80}', request_no) else '',
+            'elapsedMs': max(0, int(elapsed_ms))}
+
+
 class Client:
     def __init__(self, config):
         spec = importlib.util.spec_from_file_location('archive_mcp_upload', config['upload_helper'])
@@ -352,9 +372,24 @@ class Client:
             progress['mediaNo'] = ticket['mediaNo']
             save()
         if not progress.get('completed'):
-            self.tool('complete_note_image_upload', {'mediaNo': progress['mediaNo']})
-            progress['completed'] = True
-            save()
+            started = time.monotonic()
+            for attempt in range(1, 4):
+                try:
+                    self.api.bounded_confirm(self.url, self.secret, progress['mediaNo'])
+                    progress['completed'] = True
+                    progress.pop('confirmationError', None)
+                    progress['confirmationAttempts'] = attempt
+                    save()
+                    break
+                except Exception as error:
+                    detail = safe_error(error, 'confirm_image', 'complete_note_image_upload',
+                                        (time.monotonic() - started) * 1000)
+                    detail['attempts'] = attempt
+                    progress['confirmationAttempts'] = attempt
+                    progress['confirmationError'] = detail
+                    save()
+                    if not getattr(error, 'retryable', False) or attempt == 3:
+                        raise ImageConfirmationFailed(detail) from error
         return progress['mediaNo']
 
 
@@ -388,6 +423,8 @@ def drain(config, job_id=None, client_factory=Client):
             def save():
                 with db:
                     db.execute('UPDATE jobs SET progress=? WHERE id=?', (json.dumps(progress), job_id))
+            stage, tool_name = 'initialize', 'initialize'
+            started = time.monotonic()
             try:
                 client = client_factory(config)
                 for index, part in enumerate(json.loads(row['payload'])['parts']):
@@ -396,17 +433,28 @@ def drain(config, job_id=None, client_factory=Client):
                         continue
                     media_nos = []
                     for image_index, image in enumerate(part['images']):
-                        media_nos.append(client.upload(image, saved['images'].setdefault(str(image_index), {}), save))
+                        stage, tool_name = 'upload_image', 'prepare_note_image_upload'
+                        try:
+                            media_nos.append(client.upload(image, saved['images'].setdefault(str(image_index), {}), save))
+                        except ImageConfirmationFailed as error:
+                            saved.setdefault('imageFailures', {})[str(image_index)] = error.detail
+                            save()
                     args = {key: part[key] for key in ('title', 'text', 'clientRequestNo', 'occurredAt')}
+                    stage, tool_name = 'save_note', 'create_note'
                     result = client.tool('create_note', {**args, 'mediaNos': media_nos, 'action': 'SAVE'})
                     saved['recordNo'] = result['recordNo']
                     save()
+                partial = any(part.get('imageFailures') for part in progress.values())
                 with db:
-                    db.execute("UPDATE jobs SET status='done',error=NULL WHERE id=?", (job_id,))
+                    db.execute("UPDATE jobs SET status=?,error=? WHERE id=?",
+                               ('partial' if partial else 'done',
+                                json.dumps({'code': 'IMAGE_CONFIRMATION_FAILED', 'message': '正文已保存，部分图片未关联'}, ensure_ascii=False) if partial else None,
+                                job_id))
             except Exception as error:
                 with db:
-                    db.execute("UPDATE jobs SET status='skipped',retry_at=0,error=? WHERE id=?", (type(error).__name__, job_id))
-                AVAILABILITY.note_failure(config)
+                    db.execute("UPDATE jobs SET status='skipped',retry_at=0,error=? WHERE id=?", (json.dumps(safe_error(error, stage, tool_name, (time.monotonic() - started) * 1000), ensure_ascii=False), job_id))
+                if getattr(error, 'offline', False) or isinstance(error, (OSError, TimeoutError)):
+                    AVAILABILITY.note_failure(config)
 
 
 def kick(job_id):
@@ -453,7 +501,12 @@ def main():
         with database(config) as db:
             counts = dict(db.execute('SELECT status,COUNT(*) FROM jobs GROUP BY status').fetchall())
             jobs = [{'id': row['id'][:12], 'status': row['status'], 'attempts': row['attempts'], 'error': row['error'],
-                     'recordNos': [part['recordNo'] for part in json.loads(row['progress']).values() if part.get('recordNo')]}
+                     'recordNos': [part['recordNo'] for part in json.loads(row['progress']).values() if part.get('recordNo')],
+                     'images': [{'part': part_index, 'image': image_index, 'confirmed': image.get('completed', False),
+                                 'confirmationAttempts': image['confirmationAttempts'],
+                                 'confirmationError': image.get('confirmationError')}
+                                for part_index, part in json.loads(row['progress']).items()
+                                for image_index, image in part.get('images', {}).items() if 'confirmationAttempts' in image]}
                     for row in db.execute('SELECT * FROM jobs ORDER BY rowid DESC LIMIT 10')]
         print(json.dumps({'enabled': config['enabled'], 'project': ROOT.name, 'mode': config.get('mode', 'hooks'), 'counts': counts, 'recent': jobs}, ensure_ascii=False))
         return

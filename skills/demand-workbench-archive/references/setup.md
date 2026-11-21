@@ -26,7 +26,7 @@
 - 队列：同Codex目录下archives/demand-workbench-<项目路径摘要>/；目录0700、SQLite及图片0600，不进入项目仓库。与之前项目脚本的默认队列路径兼容，保留既有本地副本，但不再补传。
 - 项目仅需通过`.codex/archive.local.json`的enabled=false退出，不需要复制Skill或密钥到每个项目。
 - 本Skill自带MCP客户端；不使用项目配置中的upload_helper路径，不依赖原后端脚本。
-- 图片最多9张一条、PNG/JPEG/WebP每张10MiB，入队时复制；长文拆分。服务不可用时跳过本轮；上传中途失败也标记skipped，不补传。旧队列及中断任务不恢复；已成功分段/图片不回滚，本地副本不自动清理。不是常驻同步服务。
+- 图片最多9张一条、PNG/JPEG/WebP每张10MiB，入队时复制；长文拆分。服务不可用时跳过本轮；图片核验失败允许当轮最多3次即时尝试，每次总等待最多3秒，复用同一mediaNo，不重传文件；仍失败保存正文与已核验图片，任务为partial。其他上传步骤失败标记skipped，不补传。旧队列及中断任务不恢复；已成功分段/图片不回滚，本地副本不自动清理。不是常驻同步服务。
 - 继承既有脱敏规则，不能保证识别自然语言或图片中所有秘密。标题为空、Markdown不转换、末尾标签服务端识别；重复标签及本地图片标记的隐藏是网站展示能力，旧版网站可能仍展示原始文字。
 
 ## 分发
@@ -37,7 +37,7 @@
 
 gate不接收问答。按MCP地址共享离线缓存，整次握手/工具检查（包括钥匙串读取）通过独立进程限制在2秒内；失败缓存60秒，命中缓存不会延长截止时间。到期无新对话不请求；服务恢复后只保存后续新问答。在线结果不跨轮缓存；gate返回一次性availability_token，publish消费它避免重复探测，120秒过期，绑定当前项目。
 
-缓存和一次性凭据位于Codex目录的demand-workbench-archive/availability下，权限私有，不含问答或API密钥。显式check也遵守缓存。publish没有有效凭据时自行门禁，离线不建任务、不复制图片。后台进程只接收当轮job_id且尝试一次；默认drain、retry和旧Hook均不会扫描补传历史任务。后台上传失败会写入离线缓存，已完成写入不自动撤销。
+缓存和一次性凭据位于Codex目录的demand-workbench-archive/availability下，权限私有，不含问答或API密钥。显式check也遵守缓存。publish没有有效凭据时自行门禁，离线不建任务、不复制图片。后台进程只接收当轮job_id且尝试一次；默认drain、retry和旧Hook均不会扫描补传历史任务。仅MCP网络连接失败会写入离线缓存，图片存储核验失败不误判整个MCP离线；已完成写入不自动撤销。
 
 ## 三级归档标签
 
@@ -50,3 +50,11 @@ gate不接收问答。按MCP地址共享离线缓存，整次握手/工具检查
 线上新装：`python3 <skill目录>/scripts/archive.py enable --url https://api.freeligo.com/mcp`。本地开发：`python3 <skill目录>/scripts/archive.py enable --url http://localhost:8070/mcp`。分别使用对应环境的本人密钥，钥匙串当前仅保存一个归档密钥；切换环境需同步更新凭据。网站VITE_API_BASE_URL/VITE_MCP_PUBLIC_URL只控制网页，不控制本机Skill。
 
 安装：`npx skills add qujsh/demand-workbench-skills --skill demand-workbench-archive -a codex -g`。此安装方式需要Node.js 22.20+；没有Node时，从GitHub Releases下载ZIP，把demand-workbench-archive目录解压至~/.codex/skills/。两种方式选一种，避免同名Skill重复安装。安装后让Codex读取本Skill完成配置；默认归档需用户另行明确授权。
+
+## 图片核验与排查（v0.1.1）
+
+后端新版将云端stat核验总预算设为2秒（SDK连接/读写各1秒，隐藏重试关闭，有界并发2，无排队），Skill确认请求以子进程限制总等待3秒。超时、网络中断或明确的存储临时故障才重试，总计3次；不存在、大小/类型不符等明确业务失败只尝试一次。多图分别核验，等待预算按图片数累计。
+
+最终核验失败不会关联未确认媒体；原始Markdown正文和其他已确认图片照常提交，partial表示正文已保存但存在缺图。create_note失败则skipped，不补传、不重新创建。status可查看任务error（安全JSON）及images中的confirmationAttempts/confirmationError；进度中的imageFailures按图片索引记录步骤、工具、错误码、请求编号、尝试次数和耗时。原始服务商响应及凭证不写入这些字段。
+
+新错误码：S048105012=图片存储核验超时，S048105013=图片存储核验暂不可用。旧后端只返回Internal error时无法准确判别存储临时错误，不盲目重试，但仍会降级保存正文。后端改动需重启/部署后生效；仅升级Skill无法改变旧后端的SDK等待行为。

@@ -83,7 +83,8 @@ class ArchiveTest(unittest.TestCase):
         job_id = self.jobs()[0]['id']
         ARCHIVE.drain(self.config, job_id=job_id, client_factory=lambda config: Client())
         self.assertEqual(self.jobs()[0]['status'], 'skipped')
-        self.assertEqual(self.jobs()[0]['error'], 'OSError')
+        self.assertEqual(json.loads(self.jobs()[0]['error'])['code'], 'OSError')
+        self.assertNotIn('do-not-log-this-secret', self.jobs()[0]['error'])
         ARCHIVE.drain(self.config, job_id=job_id, client_factory=lambda config: Client())
         self.assertEqual(len(calls), 1)
         self.assertEqual(self.jobs()[0]['attempts'], 1)
