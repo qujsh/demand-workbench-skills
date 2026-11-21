@@ -1,0 +1,6 @@
+interface:
+  display_name: "构想台问答归档"
+  short_description: "把本轮问答和明确配图私密保存到构想台，支持跨项目默认归档及暂停恢复"
+  default_prompt: "使用 $demand-workbench-archive 将本轮问题、完整回复和明确图片保存到构想台。"
+policy:
+  allow_implicit_invocation: true
