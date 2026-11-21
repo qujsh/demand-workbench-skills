@@ -1,5 +1,8 @@
 """MCP可用性门禁：2秒整次检查、60秒离线缓存和一次性在线凭据，不接收问答内容。"""
 import hashlib
+import errno
+import socket
+from urllib.parse import urlsplit
 import json
 import math
 import os
@@ -36,37 +39,87 @@ def note_failure(config, reason='unavailable', now=None):
     write_private(directory(config) / 'offline.json', {'until': moment + OFFLINE_TTL, 'reason': reason})
 
 
-def check_once(config):
-    # 整个子进程（含钥匙串、握手和工具检查）共用2秒上限，超时即终止。
+def local_port_status(url):
+    """仅回环地址做150ms内TCP探测，不发HTTP、凭据或问答；不能确认拒绝则返回unknown。"""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return 'unknown'
+    if parsed.scheme not in ('http', 'https'):
+        return 'unknown'
+    hosts = {'localhost': ['127.0.0.1', '::1'], '127.0.0.1': ['127.0.0.1'], '::1': ['::1']}.get(parsed.hostname)
+    if not hosts:
+        return 'unknown'
+    try:
+        port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    except ValueError:
+        return 'unknown'
+    deadline = time.monotonic() + 0.15
+    refused = 0
+    for host in hosts:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 'unknown'
+        family = socket.AF_INET6 if ':' in host else socket.AF_INET
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as connection:
+                connection.settimeout(remaining)
+                connection.connect((host, port))
+                return 'open'
+        except OSError as error:
+            if error.errno != errno.ECONNREFUSED:
+                return 'unknown'
+            refused += 1
+    return 'closed' if refused == len(hosts) else 'unknown'
+
+
+def check_status(config, timeout=PROBE_TIMEOUT):
+    started = time.monotonic()
+    if local_port_status(config['url']) == 'closed':
+        return {'ready': False, 'reason': 'local_port_closed'}
     try:
         result = subprocess.run([sys.executable, str(Path(__file__).with_name('archive.py')), 'check-worker'],
-                                cwd=os.getcwd(), capture_output=True, text=True, timeout=PROBE_TIMEOUT)
-        return result.returncode == 0 and json.loads(result.stdout).get('ready') is True
+                                cwd=os.getcwd(), capture_output=True, text=True,
+                                timeout=max(0.001, timeout - (time.monotonic() - started)))
+        ready = result.returncode == 0 and json.loads(result.stdout).get('ready') is True
+        return {'ready': ready, 'reason': 'unavailable'}
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        return False
+        return {'ready': False, 'reason': 'unavailable'}
 
 
-def probe(config, checker=None, now=None):
+def check_once(config):
+    return check_status(config)['ready']
+
+
+def probe(config, checker=None, now=None, force=False):
+    started = time.monotonic()
     if not config.get('enabled'):
         return {'ready': False, 'reason': 'disabled', 'cached': False}
     moment = time.time() if now is None else now
-    root = directory(config)
-    cache = root / 'offline.json'
+    cache = directory(config) / 'offline.json'
+    saved, remaining = {}, 0
     try:
         saved = json.loads(cache.read_text())
         remaining = saved.get('until', 0) - moment
-        if remaining > 0:
+    except (OSError, ValueError, TypeError):
+        saved, remaining = {}, 0
+    if remaining > 0 and not force:
+        recovery = saved.get('reason') == 'local_port_closed' and local_port_status(config['url']) == 'open'
+        if not recovery:
             return {'ready': False, 'reason': saved.get('reason', 'unavailable'),
                     'cached': True, 'retry_after': math.ceil(remaining)}
-    except (OSError, ValueError, TypeError):
-        pass
-    if not (checker or check_once)(config):
-        # 从失败被观察到的时刻起缓存60秒；命中缓存不延长过期时间。
-        note_failure(config, now=now)
-        return {'ready': False, 'reason': 'unavailable', 'cached': False, 'retry_after': OFFLINE_TTL}
+    status = {'ready': bool(checker(config)), 'reason': 'unavailable'} if checker else check_status(config, timeout=max(0.001, PROBE_TIMEOUT - (time.monotonic() - started)))
+    if not status['ready']:
+        # 提前恢复或强制检查失败不延长既有截止时间；原因更新防止端口已开但鉴权失败时反复握手。
+        if remaining > 0:
+            write_private(cache, {'until': saved['until'], 'reason': status['reason']})
+        else:
+            note_failure(config, reason=status['reason'], now=now)
+        return {'ready': False, 'reason': status['reason'], 'cached': False,
+                'retry_after': math.ceil(remaining) if remaining > 0 else OFFLINE_TTL}
     cache.unlink(missing_ok=True)
     token = uuid.uuid4().hex
-    write_private(root / ('ready-' + token + '.json'), {'created': moment, 'project': config['state_dir']})
+    write_private(cache.parent / ('ready-' + token + '.json'), {'created': moment, 'project': config['state_dir']})
     return {'ready': True, 'cached': False, 'availability_token': token}
 
 

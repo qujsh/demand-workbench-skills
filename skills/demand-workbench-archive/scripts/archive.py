@@ -467,6 +467,7 @@ def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['hook', 'publish', 'drain', 'retry', 'status', 'set-key', 'enable', 'disable', 'check', 'gate', 'check-worker'])
+    parser.add_argument('--force', action='store_true', help='gate/check忽略离线缓存检查一次，不补传')
     parser.add_argument('--reset-failed', action='store_true')
     parser.add_argument('--job-id', help=argparse.SUPPRESS)
     parser.add_argument('--url', help='enable时设置MCP地址，仅HTTPS或本机HTTP')
@@ -492,7 +493,7 @@ def main():
         print(json.dumps({'ready': required <= available}))
         return
     if args.command in ('gate', 'check'):
-        print(json.dumps(probe(config)))
+        print(json.dumps(AVAILABILITY.probe(config, force=True) if args.force else probe(config)))
         return
     if args.command == 'retry':
         print(json.dumps({'retried': False, 'reason': 'no_retry_policy'}))

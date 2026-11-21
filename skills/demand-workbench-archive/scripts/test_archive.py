@@ -377,9 +377,10 @@ class ArchiveTest(unittest.TestCase):
     def test_complete_probe_process_has_two_second_deadline(self):
         import subprocess
         api = ARCHIVE.AVAILABILITY
-        with patch.object(api.subprocess, 'run', side_effect=subprocess.TimeoutExpired('probe', 2)) as run:
+        with patch.object(api, 'local_port_status', return_value='unknown'), patch.object(api.subprocess, 'run', side_effect=subprocess.TimeoutExpired('probe', 2)) as run:
             self.assertFalse(api.check_once(self.config))
-            self.assertEqual(run.call_args.kwargs['timeout'], 2)
+            self.assertLessEqual(run.call_args.kwargs['timeout'], 2)
+            self.assertGreater(run.call_args.kwargs['timeout'], 1.8)
 
     def test_publish_cli_does_not_start_worker_when_offline(self):
         import io

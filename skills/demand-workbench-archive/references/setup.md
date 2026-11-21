@@ -15,7 +15,7 @@
 
 ```markdown
 ## 默认构想台问答归档（用户已授权）
-在各项目主线程最终回复定稿后、发送前，应用 demand-workbench-archive Skill（<skill目录>/SKILL.md），先调用其scripts/archive.py gate（不传问答）检查；ready=false跳过本轮，ready=true才带availability_token把本轮问题、完整最终回复与明确附件交给publish。使用当前项目工作目录，不扫描历史或仓库文件。Markdown原样、标题为空、私密保存；用户要求停止或配置关闭时不提交。仅调用这个入口，不与项目旧脚本双重归档。门禁整次检查最多2秒，离线缓存60秒且缓存内不请求；不入离线队列、不补传旧内容，不阻塞正常回复。
+在各项目主线程最终回复定稿后、发送前，应用 demand-workbench-archive Skill（<skill目录>/SKILL.md），先调用其scripts/archive.py gate（不传问答）检查；ready=false跳过本轮，ready=true才带availability_token把本轮问题、完整最终回复与明确附件交给publish。使用当前项目工作目录，不扫描历史或仓库文件。Markdown原样、标题为空、私密保存；用户要求停止或配置关闭时不提交。仅调用这个入口，不与项目旧脚本双重归档。门禁整次检查最多2秒，离线缓存60秒；仅明确本地端口关闭时允许快速TCP探测并在启动后提前完整检查，其他缓存内不发MCP请求；不入离线队列、不补传旧内容，不阻塞正常回复。
 ```
 
 新全局指令需新建聊天/新会话加载；已有聊天未必立即刷新。Skill默认允许隐式调用；若看不到，重新打开Codex。官方依据：[全局AGENTS.md](https://learn.chatgpt.com/docs/agent-configuration/agents-md)、[Skill发现](https://learn.chatgpt.com/docs/build-skills)。
@@ -35,7 +35,7 @@
 
 ## 离线门禁
 
-gate不接收问答。按MCP地址共享离线缓存，整次握手/工具检查（包括钥匙串读取）通过独立进程限制在2秒内；失败缓存60秒，命中缓存不会延长截止时间。到期无新对话不请求；服务恢复后只保存后续新问答。在线结果不跨轮缓存；gate返回一次性availability_token，publish消费它避免重复探测，120秒过期，绑定当前项目。
+gate不接收问答。按MCP地址共享离线缓存，整次握手/工具检查（包括钥匙串读取）通过独立进程限制在2秒内；失败缓存60秒，命中缓存不会延长截止时间。明确因本地端口关闭失败时，每轮新消息可用150ms内TCP探测提前发现启动，再在整次2秒预算内完整检查；仍失败沿用原截止时间并更新失败原因，防止端口已开却反复握手。到期无新对话不请求；服务恢复后只保存后续新问答。在线结果不跨轮缓存；gate返回一次性availability_token，publish消费它避免重复探测，120秒过期，绑定当前项目。
 
 缓存和一次性凭据位于Codex目录的demand-workbench-archive/availability下，权限私有，不含问答或API密钥。显式check也遵守缓存。publish没有有效凭据时自行门禁，离线不建任务、不复制图片。后台进程只接收当轮job_id且尝试一次；默认drain、retry和旧Hook均不会扫描补传历史任务。仅MCP网络连接失败会写入离线缓存，图片存储核验失败不误判整个MCP离线；已完成写入不自动撤销。
 
@@ -58,3 +58,9 @@ gate不接收问答。按MCP地址共享离线缓存，整次握手/工具检查
 最终核验失败不会关联未确认媒体；原始Markdown正文和其他已确认图片照常提交，partial表示正文已保存但存在缺图。create_note失败则skipped，不补传、不重新创建。status可查看任务error（安全JSON）及images中的confirmationAttempts/confirmationError；进度中的imageFailures按图片索引记录步骤、工具、错误码、请求编号、尝试次数和耗时。原始服务商响应及凭证不写入这些字段。
 
 新错误码：S048105012=图片存储核验超时，S048105013=图片存储核验暂不可用。旧后端只返回Internal error时无法准确判别存储临时错误，不盲目重试，但仍会降级保存正文。后端改动需重启/部署后生效；仅升级Skill无法改变旧后端的SDK等待行为。
+
+## 本地服务启动后提前恢复（v0.1.2）
+
+仅localhost/127.0.0.1/::1的明确连接拒绝标记local_port_closed；连接超时、鉴权失败、地址非回环及旧unavailable缓存不推断为端口关闭。此类缓存每轮仅做一次TCP探测（最多150ms，localhost同时考虑IPv4/IPv6），不发送凭证和正文；端口恢复则立即完整检查，通过后移除缓存，仅保存当前轮。端口打开不等于MCP可用；完整检查失败保持原截止时间并更新失败原因。无新消息不轮询。
+
+用户明确要求重新检查时：`python3 <skill目录>/scripts/archive.py check --force`；准备归档可用`gate --force`并消费返回凭据，不再重复gate。force仅忽略离线缓存，仍检查enabled、项目禁用及实际权限，不上传正文、不补传；失败不会延长已有未到期缓存。默认行为不对线上地址做缓存内额外探测。
