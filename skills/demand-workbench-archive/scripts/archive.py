@@ -67,8 +67,12 @@ def settings():
     config['availability_dir'] = str(CODEX_DIR / 'demand-workbench-archive/availability')
     config['state_dir'] = str(CODEX_DIR / 'archives' / ('demand-workbench-' + hashlib.sha256(str(ROOT).encode()).hexdigest()[:12]))
     local = ROOT / '.codex/archive.local.json'
-    if local.exists() and json.loads(local.read_text()).get('enabled') is False:
-        config['enabled'] = False
+    if local.exists():
+        project_config = json.loads(local.read_text())
+        if project_config.get('enabled') is False:
+            config['enabled'] = False
+        if 'project_id' in project_config:
+            config['project_id'] = project_config['project_id']
     return config
 
 
@@ -284,6 +288,22 @@ def publish(value, config):
         if not ready['ready']:
             return {'queued': False, 'skipped': True, 'reason': ready['reason']}
         AVAILABILITY.consume_ticket(config, ready.get('availability_token'))
+    spec = importlib.util.spec_from_file_location('archive_numbered_journal', SKILL_ROOT / 'scripts/numbered_journal.py')
+    numbered = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(numbered)
+    numbered_text = value.get('journal_text', value.get('question'))
+    if (isinstance(numbered_text, str) and re.match(r'^\s*\[日志[:：]', numbered_text)) or value.get('mode') == 'numbered_journal':
+        return numbered.queue(value, config, globals())
+    if config.get('native_edit_enabled'):
+        spec = importlib.util.spec_from_file_location('archive_native_edit', SKILL_ROOT / 'scripts/native_edit.py')
+        native = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(native)
+        return native.queue(value, config, globals(), numbered)
+    if value.get('mode') == 'journal':
+        spec = importlib.util.spec_from_file_location('archive_journal', SKILL_ROOT / 'scripts/journal.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.queue(value, config, globals())
     question, answer = value.get('question'), value.get('answer')
     if not isinstance(question, str) or not question.strip() or not isinstance(answer, str) or not answer.strip():
         raise ValueError('question和answer必须为非空文本')
@@ -330,12 +350,12 @@ class ImageConfirmationFailed(Exception):
 def safe_error(error, stage, tool='', elapsed_ms=0):
     detail = error.detail() if callable(getattr(error, 'detail', None)) else {}
     code = detail.get('code', type(error).__name__)
-    if not (re.fullmatch(r'(?:S[0-9]{9}|-[0-9]{5}|HTTP_[1-5][0-9]{2})', str(code)) or code in {'NETWORK_TIMEOUT', 'NETWORK_ERROR', 'CONFIRM_WORKER_FAILED', 'INVALID_RESPONSE', 'REMOTE_ERROR', 'OSError', 'TimeoutError', 'ValueError', 'FileNotFoundError', 'KeyError', 'JSONDecodeError'}):
+    if not (re.fullmatch(r'(?:S[0-9]{9}|-[0-9]{5}|HTTP_[1-5][0-9]{2})', str(code)) or code in {'NETWORK_TIMEOUT', 'NETWORK_ERROR', 'CONFIRM_WORKER_FAILED', 'INVALID_RESPONSE', 'REMOTE_ERROR', 'OSError', 'TimeoutError', 'ValueError', 'FileNotFoundError', 'KeyError', 'JSONDecodeError', 'JOURNAL_CONFLICT', 'NATIVE_METADATA_UNAVAILABLE', 'NATIVE_TRIGGER_UNSUPPORTED', 'NATIVE_SNAPSHOT_STALE', 'NATIVE_EDIT_BASELINE_MISSING', 'NATIVE_EDIT_TARGET_UNKNOWN'}):
         code = 'UNKNOWN_ERROR'
     request_no = detail.get('requestNo', '')
     return {'stage': stage, 'tool': tool, 'code': code,
             'message': {'S048105012': '图片存储核验超时', 'S048105013': '图片存储核验暂不可用',
-                        'NETWORK_TIMEOUT': '请求超时', 'NETWORK_ERROR': '网络请求失败'}.get(code, '操作失败'),
+                        'JOURNAL_CONFLICT': '原笔记版本或状态已变更，未覆盖', 'NETWORK_TIMEOUT': '请求超时', 'NETWORK_ERROR': '网络请求失败'}.get(code, '操作失败'),
             'requestNo': request_no if isinstance(request_no, str) and re.fullmatch(r'CALL-[A-Za-z0-9-]{1,80}', request_no) else '',
             'elapsedMs': max(0, int(elapsed_ms))}
 
@@ -427,6 +447,27 @@ def drain(config, job_id=None, client_factory=Client):
             started = time.monotonic()
             try:
                 client = client_factory(config)
+                payload = json.loads(row['payload'])
+                if payload.get('mode') == 'numbered_journal':
+                    spec = importlib.util.spec_from_file_location('archive_numbered_journal', SKILL_ROOT / 'scripts/numbered_journal.py')
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    stage, tool_name = 'numbered_journal', 'sync_codex_note'
+                    module.execute(payload, config, client, db, progress, save, globals())
+                    with db:
+                        db.execute('UPDATE jobs SET status=?,error=NULL WHERE id=?',
+                                   ('partial' if progress.get('0', {}).get('imageFailures') else 'done', job_id))
+                    return
+                if payload.get('mode') == 'journal':
+                    spec = importlib.util.spec_from_file_location('archive_journal', SKILL_ROOT / 'scripts/journal.py')
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    stage, tool_name = 'journal', 'update_note' if payload['operation'] == 'update' else 'create_note'
+                    module.execute(payload, config, client, db, progress, save, globals())
+                    with db:
+                        db.execute('UPDATE jobs SET status=?,error=NULL WHERE id=?',
+                                   ('partial' if progress.get('0', {}).get('imageFailures') else 'done', job_id))
+                    return
                 for index, part in enumerate(json.loads(row['payload'])['parts']):
                     saved = progress.setdefault(str(index), {'images': {}})
                     if saved.get('recordNo'):
@@ -490,6 +531,8 @@ def main():
         client = Client(config)
         available = {tool['name'] for tool in client.api.rpc(client.url, client.secret, 'tools/list', {})['tools']}
         required = {'create_note', 'prepare_note_image_upload', 'complete_note_image_upload'}
+        if config.get('native_edit_enabled'):
+            required |= {'get_note', 'get_codex_note', 'sync_codex_note'}
         print(json.dumps({'ready': required <= available}))
         return
     if args.command in ('gate', 'check'):
@@ -530,5 +573,5 @@ if __name__ == '__main__':
     try:
         main()
     except Exception as error:
-        print('归档失败：' + type(error).__name__, file=sys.stderr)
+        print(json.dumps({'queued': False, 'error': safe_error(error, 'publish')}, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)

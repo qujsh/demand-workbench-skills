@@ -5,8 +5,8 @@ import zipfile
 
 root = Path(__file__).resolve().parents[1]
 name = 'demand-workbench-archive'
-files = ['SKILL.md', 'agents/openai.yaml', 'references/setup.md',
-         'scripts/archive.py', 'scripts/availability.py', 'scripts/mcp_client.py']
+files = ['SKILL.md', 'agents/openai.yaml', 'references/setup.md', 'references/numbered-journal.md', 'references/native-edit.md',
+         'scripts/archive.py', 'scripts/availability.py', 'scripts/mcp_client.py', 'scripts/journal.py', 'scripts/numbered_journal.py', 'scripts/native_edit.py']
 out = root / 'dist'
 out.mkdir(exist_ok=True)
 archive = out / (name + '.zip')
